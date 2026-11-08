@@ -88,9 +88,26 @@ Tools: `list_properties`, `check_availability`, `list_stays`, `get_stay`, `previ
 call `preview_stay` and show the figures before `log_stay`, and `log_stay` refuses
 overlapping dates until `acknowledge_overlap` is set. There is no delete tool.
 
-To connect from Grok: grok.com, Connectors, New Connector, Custom, URL
-`https://suitesouth.vanburenadvisory.com/api/mcp`, and the API key as a bearer token.
-Any client that speaks Streamable HTTP (Claude, Cursor, `mcp-remote`) connects the same way.
+### Connecting an assistant
+
+Clients that can send a header use the API key as a bearer token. Clients that insist on
+OAuth (Grok's custom connector does) use the built-in authorization server:
+
+| Field | Value |
+| --- | --- |
+| Server URL | `https://suitesouth.vanburenadvisory.com/api/mcp` |
+| Client ID | any name, e.g. `grok` |
+| Client secret | leave empty |
+| Authorization endpoint | `https://suitesouth.vanburenadvisory.com/oauth/authorize` |
+| Token endpoint | `https://suitesouth.vanburenadvisory.com/oauth/token` |
+| Scopes | leave empty (or `stays`) |
+| Token auth method | none / PKCE |
+
+Discovery documents live at `/.well-known/oauth-authorization-server` and
+`/.well-known/oauth-protected-resource`, so clients that support discovery fill those in
+themselves. The sign-in page asks for the site's shared password and then issues a token
+signed with `SESSION_SECRET`; nothing is stored. Tokens last 30 days and refresh for 180.
+Rotating `SESSION_SECRET` signs everyone out of both the site and every connector.
 
 The shared parsing has its own assertions: `npm run check:api`.
 

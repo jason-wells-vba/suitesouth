@@ -1,6 +1,7 @@
 import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { checkApiKey } from "@/lib/api/auth";
+import { origin } from "@/lib/oauth-metadata";
 import { checkAvailability } from "@/lib/availability";
 import { isValidDate, todayLocal } from "@/lib/dates";
 import { nightsBetween } from "@/lib/calc";
@@ -347,11 +348,19 @@ const mcp = createMcpHandler(
   },
 );
 
-/** Plain 401 on a bad key. No OAuth challenge, so clients do not try to start one. */
+/**
+ * Accepts the static API key or an OAuth access token from /oauth/token.
+ * The 401 carries the RFC 9728 challenge so an OAuth-only client (Grok,
+ * Claude) can discover /oauth/authorize on its own.
+ */
 async function handler(request: Request): Promise<Response> {
   const auth = checkApiKey(request);
   if (!auth.ok) {
-    return Response.json({ error: auth.message }, { status: auth.status });
+    const headers: Record<string, string> = {};
+    if (auth.status === 401) {
+      headers["WWW-Authenticate"] = `Bearer resource_metadata="${origin(request)}/.well-known/oauth-protected-resource"`;
+    }
+    return Response.json({ error: auth.message }, { status: auth.status, headers });
   }
   return mcp(request);
 }
