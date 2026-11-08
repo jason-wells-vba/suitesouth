@@ -1,6 +1,5 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import {
   createSession,
@@ -9,14 +8,8 @@ import {
   requireAuth,
   verifyPassword,
 } from "@/lib/auth";
-import { insertBooking } from "@/lib/db/bookings";
-import { createCustomer } from "@/lib/db/customers";
-import { findEventForStay } from "@/lib/db/events";
-import { listProperties } from "@/lib/db/properties";
-import { findConflicts } from "@/lib/availability";
-import { nightsBetween } from "@/lib/calc";
-import { formatRange } from "@/lib/dates";
-import { STATE_LABELS } from "@/lib/booking-state";
+import { parseLogStayInput } from "@/lib/services/stay-input";
+import { logStay, StayError } from "@/lib/services/stays";
 
 export type FormState = {
   ok: boolean;
@@ -30,21 +23,6 @@ const fail = (error: string): FormState => ({ ok: false, error, savedAt: 0 });
 
 function text(formData: FormData, name: string): string {
   return String(formData.get(name) ?? "").trim();
-}
-
-/** Accepts "1,250.00" or "$1250" and returns NaN for anything that is not a non-negative number. */
-function amount(formData: FormData, name: string): number {
-  const raw = text(formData, name).replace(/[$,\s]/g, "");
-  if (!raw) return 0;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : NaN;
-}
-
-function optionalAmount(formData: FormData, name: string): number | null {
-  const raw = text(formData, name).replace(/[$,\s]/g, "");
-  if (!raw) return null;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : NaN;
 }
 
 export async function login(_prev: FormState, formData: FormData): Promise<FormState> {
@@ -67,108 +45,61 @@ export async function logout(): Promise<void> {
   redirect("/login");
 }
 
+/** The parser's messages name API fields; the form says it the way the screen does. */
+const FORM_MESSAGES: Record<string, string> = {
+  "property is required (id or name).": "Pick a property.",
+  "check_in must be a YYYY-MM-DD date.": "Both dates are required.",
+  "check_out must be a YYYY-MM-DD date.": "Both dates are required.",
+  "check_out must be after check_in.": "Check-out must be after check-in.",
+  "nights must be a whole number above zero.": "Nights must be a whole number above zero.",
+  "room_revenue must be a non-negative number.": "Amounts must be non-negative numbers.",
+  "fees must be a non-negative number.": "Amounts must be non-negative numbers.",
+  "tax_amount must be a non-negative number.": "Amounts must be non-negative numbers.",
+  "amount_received must be a non-negative number.": "Amounts must be non-negative numbers.",
+  "Either customer_id or a customer with last_name is required.": "A guest name is required.",
+};
+
 export async function createBooking(_prev: FormState, formData: FormData): Promise<FormState> {
   if (!(await isAuthenticated())) return fail("Session expired. Reload the page and sign in again.");
 
-  const propertyId = text(formData, "property_id");
-  const checkIn = text(formData, "check_in");
-  const checkOut = text(formData, "check_out");
-
-  if (!propertyId) return fail("Pick a property.");
-  if (!checkIn || !checkOut) return fail("Both dates are required.");
-
-  const computedNights = nightsBetween(checkIn, checkOut);
-  if (computedNights <= 0) return fail("Check-out must be after check-in.");
-
-  const nightsRaw = text(formData, "nights");
-  const nights = nightsRaw ? Number(nightsRaw) : computedNights;
-  if (!Number.isInteger(nights) || nights <= 0) return fail("Nights must be a whole number above zero.");
-
-  const roomRevenue = amount(formData, "room_revenue");
-  const fees = amount(formData, "fees");
-  const taxAmount = optionalAmount(formData, "tax_amount");
-  const amountReceived = amount(formData, "amount_received");
-  if ([roomRevenue, fees, amountReceived].some(Number.isNaN) || Number.isNaN(taxAmount)) {
-    return fail("Amounts must be non-negative numbers.");
-  }
-
-  // Overlaps warn but never block. The first save is held so she can see the
-  // conflict; pressing Save anyway comes back with the acknowledgement set.
-  if (!text(formData, "acknowledge_overlap")) {
-    const property = (await listProperties()).find((p) => p.id === propertyId);
-    if (property) {
-      const conflicts = await findConflicts({
-        propertyId,
-        checkIn,
-        checkOut,
-        turnaroundDays: property.turnaroundDays,
-      });
-      if (conflicts.length > 0) {
-        return {
-          ok: false,
-          error: null,
-          savedAt: 0,
-          warnings: conflicts.map(
-            (c) =>
-              `${property.name} overlaps ${c.customerName}, ${formatRange(c.checkIn, c.checkOut)} (${STATE_LABELS[c.state]})`,
-          ),
-        };
-      }
-    }
-  }
-
-  // Either an existing customer was picked, or the typed name becomes a new one.
-  let customerId = text(formData, "customer_id");
-  if (!customerId) {
-    const lastName = text(formData, "new_last_name");
-    if (!lastName) return fail("A guest name is required.");
-    const firstName = text(formData, "new_first_name") || null;
-    const phone = text(formData, "new_phone") || null;
-    try {
-      customerId = await createCustomer({
-        firstName,
-        lastName,
-        phone,
-        email: null,
-        address: null,
-        notes: null,
-        // A brand-new guest has no standing agreement; set it on their record later.
-        hasStandingContract: false,
-      });
-    } catch (error) {
-      console.error("createCustomer failed", error);
-      return fail("Could not save the customer. Check the connection and try again.");
-    }
-  }
-
-  const notes = text(formData, "notes") || null;
+  // The same parser and rules the REST API and MCP tools use; only the field
+  // names and the wording of errors are the form's own.
+  const parsed = parseLogStayInput({
+    property: text(formData, "property_id"),
+    check_in: text(formData, "check_in"),
+    check_out: text(formData, "check_out"),
+    nights: text(formData, "nights") || undefined,
+    room_revenue: text(formData, "room_revenue"),
+    fees: text(formData, "fees"),
+    tax_amount: text(formData, "tax_amount") || undefined,
+    amount_received: text(formData, "amount_received"),
+    customer_id: text(formData, "customer_id") || undefined,
+    customer: {
+      last_name: text(formData, "new_last_name"),
+      first_name: text(formData, "new_first_name"),
+      phone: text(formData, "new_phone"),
+    },
+    notes: text(formData, "notes"),
+    confirmed: text(formData, "confirmed") === "1",
+    acknowledge_overlap: Boolean(text(formData, "acknowledge_overlap")),
+  });
+  if (!parsed.ok) return fail(FORM_MESSAGES[parsed.errors[0]] ?? parsed.errors[0]);
 
   try {
-    // Auto-associate with whichever event overlaps this stay the most.
-    const event = await findEventForStay(checkIn, checkOut);
-    await insertBooking({
-      propertyId,
-      customerId,
-      eventId: event?.id ?? null,
-      checkIn,
-      checkOut,
-      roomRevenue,
-      nights,
-      fees,
-      taxAmount,
-      amountReceived,
-      notes,
-      // One tick at entry instead of two edits and two saves afterwards.
-      confirmed: text(formData, "confirmed") === "1",
-    });
+    await logStay(parsed.value);
   } catch (error) {
+    if (error instanceof StayError) {
+      // Overlaps warn but never block. The first save is held so she can see the
+      // conflict; pressing Save anyway comes back with the acknowledgement set.
+      if (error.code === "conflict") {
+        return { ok: false, error: null, savedAt: 0, warnings: error.details.warnings as string[] };
+      }
+      return fail(error.message);
+    }
     console.error("createBooking failed", error);
     return fail("Could not save the booking. Check the connection and try again.");
   }
 
-  revalidatePath("/");
-  revalidatePath("/stays");
-  revalidatePath("/calendar");
   return { ok: true, error: null, savedAt: Date.now() };
 }
 

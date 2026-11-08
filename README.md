@@ -23,6 +23,77 @@ Suite South STR Booking. Fast booking entry for three short-term rental condos. 
 
    This applies `db/schema.sql` and seeds the three properties. It is safe to re-run.
 
+## REST API and MCP server
+
+Machine access for scripts and AI assistants. Both use one bearer key, the `API_KEY`
+environment variable, which is separate from the site password so either can be
+rotated alone. Leave it unset and both endpoints answer 503.
+
+Send the key as `Authorization: Bearer <key>` (or `x-api-key: <key>`). Bodies are JSON;
+field names may be `snake_case` or `camelCase`. Dates are `YYYY-MM-DD`.
+
+### REST, under `/api/v1`
+
+| Method | Path | Does |
+| --- | --- | --- |
+| `GET` | `/properties` | The condos with rate terms and turnaround days |
+| `GET` | `/availability?check_in=&check_out=[&event_id=]` | Per-condo availability with conflicts, matched event, suggested rate, prior-year prices |
+| `GET` | `/stays?property=&customer_id=&event_id=&from=&to=&state=&limit=` | List stays. `property` is an id or a name; `state` is hold, committed, booked, confirmed or cancelled |
+| `POST` | `/stays` | Log a stay (below). `"preview": true` returns the split and overlaps without saving |
+| `GET` | `/stays/:id` | One stay with its payments |
+| `PATCH` | `/stays/:id` | `event_id`, `turnaround_days`, `lifecycle`, `hold_expires_at`, `notes` |
+| `PUT` | `/stays/:id/status` | `contract_status` and/or `invoice_status` |
+| `GET` `POST` | `/stays/:id/payments` | List or record a payment: `amount`, `received_at?`, `note?` |
+| `DELETE` | `/stays/:id/payments/:paymentId` | Remove a payment |
+| `GET` `POST` | `/customers` | Search (`?search=`) or create. Possible duplicates answer 409 until `acknowledge_duplicate` is true |
+| `GET` `PATCH` | `/customers/:id` | A customer and their stays; edit any field |
+| `GET` | `/events?year=&month=` or `?upcoming=true` | Named weekends with suggested rates |
+
+Logging a stay:
+
+```json
+POST /api/v1/stays
+{
+  "property": "The Kerry",
+  "check_in": "2027-03-05",
+  "check_out": "2027-03-08",
+  "room_revenue": 1500,
+  "customer": { "last_name": "Smith", "first_name": "Ann", "phone": "555-0100" },
+  "confirmed": true
+}
+```
+
+Pass `customer_id` instead of `customer` for an existing guest. The event is matched
+automatically from the dates; send `event_id` to pick one or `null` for none. If the dates
+overlap another stay the answer is `409` with the warnings, and nothing is saved until the
+same request is resent with `"acknowledge_overlap": true`. That mirrors the website's
+confirm step.
+
+As on the site, a stay's dates, property and revenue are frozen once logged, because the
+owner split was computed from the rate terms in force at entry. Cancel the stay
+(`lifecycle: "cancelled"`) and log it again instead.
+
+Errors come back as `{ "error": "...", ...details }` with `400` (invalid), `401` (key),
+`404`, `409` (conflict) or `500`.
+
+### MCP, at `/api/mcp`
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server over Streamable HTTP,
+built with `mcp-handler`. Same key, same rules: every tool calls the service layer in
+`lib/services/stays.ts` that the website and the REST routes use.
+
+Tools: `list_properties`, `check_availability`, `list_stays`, `get_stay`, `preview_stay`,
+`log_stay`, `update_stay`, `set_stay_status`, `record_payment`, `find_customers`,
+`create_customer`, `list_events`, `today`. The server instructions tell the assistant to
+call `preview_stay` and show the figures before `log_stay`, and `log_stay` refuses
+overlapping dates until `acknowledge_overlap` is set. There is no delete tool.
+
+To connect from Grok: grok.com, Connectors, New Connector, Custom, URL
+`https://suitesouth.vanburenadvisory.com/api/mcp`, and the API key as a bearer token.
+Any client that speaks Streamable HTTP (Claude, Cursor, `mcp-remote`) connects the same way.
+
+The shared parsing has its own assertions: `npm run check:api`.
+
 ## Commands
 
 ```bash
